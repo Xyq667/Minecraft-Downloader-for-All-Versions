@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyInstaller
+*.spec
+dist/
+build/MCVersionDownloader/
+build/hello*/
+build/write*/
+
+# Local runtime data
+settings.json
+download_stats.json
+version.json
+*.log
+.error
+_MEI*/
+.downloads/
+
+# Local executables (publish via GitHub Releases)
+MC全版本下载器.exe
+MCVersionDownloader.exe
+MCVersionDownloader-*-all.zip
+releases/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
