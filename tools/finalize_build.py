@@ -14,6 +14,14 @@ from mcvd import __version__  # noqa: E402
 from tools.archive_all import create_all_archive  # noqa: E402
 from tools.archive_source import create_source_archive  # noqa: E402
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 DIST = ROOT / "dist"
 SOURCE = DIST / "MCVersionDownloader.exe"
 LOCAL_TARGET = DIST / "MC全版本下载器.exe"
