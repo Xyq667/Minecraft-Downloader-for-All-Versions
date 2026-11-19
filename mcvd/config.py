@@ -12,11 +12,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .theme import palette_for
+
 APP_NAME = "MC 全版本下载器"
 APP_NAME_EN = "MC Version Downloader"
 APP_ID = "MCVersionDownloader"
-APP_VERSION = "v1.1.0"
-APP_VERSION_DISPLAY = "v1.1.0"
+APP_VERSION = "v2.0.0"
+APP_VERSION_DISPLAY = "v2.0.0"
 USER_AGENT = f"{APP_NAME_EN}/{APP_VERSION} (+https://www.minecraft.net/)"
 AUTHOR = "Xyq_yy"
 GITHUB_URL = "https://github.com/Xyq667/Minecraft-Downloader-for-All-Versions"
@@ -59,28 +61,9 @@ TYPE_LABELS = {
 }
 TYPE_ORDER = {"release": 0, "snapshot": 1, "old_beta": 2, "old_alpha": 3}
 
-# Palette used by the GUI and the generated icon.
-COLORS = {
-    "bg": "#0b0f14",
-    "bg_alt": "#0d131b",
-    "card": "#111823",
-    "card_alt": "#151d27",
-    "border": "#222d3a",
-    "border_soft": "#1a2430",
-    "text": "#e8eef6",
-    "text_soft": "#c5d0dd",
-    "muted": "#8492a5",
-    "muted_dark": "#617086",
-    "accent": "#46df87",
-    "accent_hover": "#69eba0",
-    "accent_dark": "#2cbf6b",
-    "accent_soft": "#173426",
-    "blue": "#76a9ff",
-    "warning": "#f0b35b",
-    "danger": "#ff7777",
-    "danger_soft": "#341d22",
-    "black": "#06130b",
-}
+# Palette used by the GUI and the generated icon. It starts as the light
+# theme and is rewritten in place when the user changes appearance settings.
+COLORS = palette_for("light", "green")
 
 FONT_FAMILY = "Microsoft YaHei UI"
 
@@ -406,6 +389,10 @@ class Settings:
     geometry: str = ""
     loader: str = "none"
     agreement_accepted: bool = False
+    theme: str = "light"
+    accent: str = "green"
+    glass: bool = False
+    card_opacity: int = 100
 
     def __post_init__(self) -> None:
         if self.mode not in ("core", "full"):
@@ -413,6 +400,16 @@ class Settings:
         if self.loader not in ("none", "fabric", "quilt", "forge", "neoforge"):
             self.loader = "none"
         self.agreement_accepted = bool(self.agreement_accepted)
+        if self.theme not in ("light", "dark"):
+            self.theme = "light"
+        if self.accent not in ("green", "blue", "purple", "orange", "red"):
+            self.accent = "green"
+        self.glass = bool(self.glass)
+        try:
+            self.card_opacity = int(self.card_opacity)
+        except (TypeError, ValueError):
+            self.card_opacity = 100
+        self.card_opacity = max(50, min(100, self.card_opacity))
         if not self.game_dir:
             self.game_dir = str(default_game_dir())
 
@@ -434,6 +431,10 @@ class Settings:
                 "geometry",
                 "loader",
                 "agreement_accepted",
+                "theme",
+                "accent",
+                "glass",
+                "card_opacity",
             )
             if key in raw
         }

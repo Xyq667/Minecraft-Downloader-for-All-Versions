@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 0, 0),
-    prodvers=(1, 1, 0, 0),
+    filevers=(2, 0, 0, 0),
+    prodvers=(2, 0, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,13 +17,13 @@ VSVersionInfo(
           '080404B0',
           [
             StringStruct('CompanyName', 'MC Version Downloader'),
-            StringStruct('FileDescription', 'MC 全版本下载器 v1.1.0 - Minecraft Java 版官方版本下载工具'),
-            StringStruct('FileVersion', 'v1.1.0'),
+            StringStruct('FileDescription', 'MC 全版本下载器 v2.0.0 - Minecraft Java 版官方版本下载工具'),
+            StringStruct('FileVersion', 'v2.0.0'),
             StringStruct('InternalName', 'MCVersionDownloader'),
             StringStruct('LegalCopyright', 'Free utility. Not affiliated with Mojang or Microsoft.'),
             StringStruct('OriginalFilename', 'MCVersionDownloader.exe'),
             StringStruct('ProductName', 'MC 全版本下载器'),
-            StringStruct('ProductVersion', 'v1.1.0')
+            StringStruct('ProductVersion', 'v2.0.0')
           ]
         )
       ]

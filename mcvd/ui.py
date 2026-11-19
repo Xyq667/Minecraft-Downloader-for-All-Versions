@@ -74,13 +74,43 @@ from .loaders import (
     install_loader_files,
     list_loader_versions,
 )
+from .mods import (
+    LOADER_LABELS as MOD_LOADER_LABELS,
+    SORT_OPTIONS as MOD_SORT_OPTIONS,
+    ModProject,
+    ModVersion,
+    fetch_mod_versions,
+    install_mod,
+    mods_dir,
+    search_mods,
+)
 from .net import DownloadCancelled
+from .theme import (
+    ACCENT_LABELS,
+    GLASS_KEY,
+    ACCENT_ORDER,
+    THEME_LABELS,
+    THEME_ORDER,
+    accent_color,
+    apply_card_opacity,
+    apply_palette,
+    apply_window_glass,
+    is_dark,
+    palette_for,
+)
 from .stats import (
     average_speed,
     clear_stats,
     load_stats,
     record_download,
     stats_path,
+)
+from .wiki import (
+    WikiHit,
+    WikiPage,
+    fetch_wiki_page,
+    random_page as random_wiki_page,
+    search_wiki,
 )
 
 C = COLORS
@@ -134,7 +164,7 @@ def _enable_dpi_awareness() -> None:
         pass
 
 
-def _set_dark_titlebar(window: tk.Misc) -> None:
+def _set_dark_titlebar(window: tk.Misc, dark: bool = True) -> None:
     if os.name != "nt":
         return
     try:
@@ -142,7 +172,7 @@ def _set_dark_titlebar(window: tk.Misc) -> None:
         hwnd = ctypes.windll.user32.GetAncestor(raw, 2)  # GA_ROOT
         if not hwnd:
             hwnd = raw
-        enabled = ctypes.c_int(1)
+        enabled = ctypes.c_int(1 if dark else 0)
         result = None
         for attribute in (20, 19):
             result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -150,10 +180,10 @@ def _set_dark_titlebar(window: tk.Misc) -> None:
             )
             if result == 0:
                 break
-        LOGGER.debug("dark titlebar raw=%s hwnd=%s result=%s", raw, hwnd, result)
+        LOGGER.debug("titlebar dark=%s raw=%s hwnd=%s result=%s", dark, raw, hwnd, result)
         # Windows 11 title bar colours (harmless on older builds).
-        caption = ctypes.c_int(0x000B0F14)
-        text = ctypes.c_int(0x00E8EEF6)
+        caption = ctypes.c_int(0x00140F0B if dark else 0x00FFFFFF)
+        text = ctypes.c_int(0x00E8EEF6 if dark else 0x00241A10)
         for attribute, value in ((35, caption), (36, text)):
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
@@ -252,12 +282,12 @@ class Button(tk.Button):
     ):
         self.kind = kind
         self._normal_bg, self._normal_fg, self._active_bg, self._disabled_bg, self._disabled_fg = {
-            "primary": (C["accent"], C["black"], C["accent_hover"], "#1d3328", "#6e8d7a"),
-            "ghost": (C["card_alt"], C["text_soft"], "#1d2937", "#101720", C["muted_dark"]),
-            "danger": (C["danger_soft"], C["danger"], "#4a252c", "#21171a", "#76535a"),
+            "primary": (C["accent"], C["accent_fg"], C["accent_hover"], C["disabled_bg"], C["disabled_fg"]),
+            "ghost": (C["card_alt"], C["text_soft"], C["hover_bg"], C["disabled_bg"], C["disabled_fg"]),
+            "danger": (C["danger_soft"], C["danger"], C["danger_hover"], C["disabled_bg"], C["disabled_fg"]),
             "subtle": (C["card"], C["muted"], C["card_alt"], C["card"], C["muted_dark"]),
             "link": (C["card"], C["accent"], C["card"], C["card"], C["muted_dark"]),
-        }.get(kind, ("#1b2531", C["text"], "#243240", "#151d27", C["muted_dark"]))
+        }.get(kind, (C["card_alt"], C["text"], C["hover_bg"], C["disabled_bg"], C["disabled_fg"]))
         super().__init__(
             master,
             text=text,
@@ -2624,6 +2654,1313 @@ class StatsDialog(tk.Toplevel):
             pass
 
 
+def _center_window(
+    window: tk.Misc, parent: tk.Misc, width: int, height: int
+) -> None:
+    """Place a resizable dialog centred on its parent, clamped to the screen."""
+    window.update_idletasks()
+    try:
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+    except tk.TclError:
+        px = py = 0
+        pw = ph = 0
+    sw, sh = window.winfo_screenwidth(), window.winfo_screenheight()
+    if pw <= 1 or ph <= 1:
+        pw, ph = sw, sh
+    x = min(max(0, px + (pw - width) // 2), max(0, sw - width))
+    y = min(max(0, py + (ph - height) // 2), max(0, sh - height))
+    window.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def _count_text(value: int) -> str:
+    if value >= 100_000_000:
+        return f"{value / 100_000_000:.1f} 亿"
+    if value >= 10_000:
+        return f"{value / 10_000:.1f} 万"
+    return str(value)
+
+
+class WikiDialog(tk.Toplevel):
+    """Search and read articles from zh.minecraft.wiki without leaving the app."""
+
+    def __init__(self, app: "Application"):
+        super().__init__(app.root)
+        self.app = app
+        self.configure(bg=C["bg"])
+        self.title("Minecraft Wiki（中文）")
+        self.transient(app.root)
+        self._closed = False
+        self._queue: queue.Queue = queue.Queue()
+        self._search_cancel = threading.Event()
+        self._page_cancel = threading.Event()
+        self._search_token = 0
+        self._page_token = 0
+        self._hits: list[WikiHit] = []
+        self._page: WikiPage | None = None
+        _try_icon(self)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda _event: self._close())
+        self.bind("<Control-f>", lambda _event: self.search_entry.focus_set())
+
+        shell = Card(self)
+        shell.pack(fill="both", expand=True, padx=s(1), pady=s(1))
+        inner = tk.Frame(shell, bg=C["card"])
+        inner.pack(fill="both", expand=True, padx=s(20), pady=s(16))
+
+        tk.Label(
+            inner,
+            text="Minecraft Wiki",
+            bg=C["card"],
+            fg=C["text"],
+            font=app.f_h1,
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            inner,
+            text="搜索中文 Minecraft Wiki 条目，正文直接显示在这里；需要完整排版时可在浏览器中打开。",
+            bg=C["card"],
+            fg=C["muted"],
+            font=app.f_small,
+            anchor="w",
+            justify="left",
+            wraplength=s(900),
+        ).pack(fill="x", pady=(s(3), s(12)))
+
+        search_row = tk.Frame(inner, bg=C["card"])
+        search_row.pack(fill="x", pady=(0, s(11)))
+        self.search_entry = PlaceholderEntry(
+            search_row,
+            "搜索方块、物品或机制，如 钻石 / 红石 / 下界",
+            width=38,
+            font=app.f_small,
+        )
+        self.search_entry.pack(side="left", ipady=s(6))
+        self.search_entry.bind("<Return>", lambda _event: self._start_search())
+        self.search_btn = Button(
+            search_row,
+            "搜索",
+            self._start_search,
+            kind="primary",
+            font=app.f_small_bold,
+            padx=s(18),
+            pady=s(6),
+        )
+        self.search_btn.pack(side="left", padx=(s(8), 0))
+        self.random_btn = Button(
+            search_row,
+            "随机条目",
+            self._open_random,
+            kind="ghost",
+            font=app.f_small,
+            padx=s(12),
+            pady=s(6),
+        )
+        self.random_btn.pack(side="left", padx=(s(8), 0))
+        tk.Label(
+            search_row,
+            text="双击结果阅读 · Ctrl+F 定位搜索框",
+            bg=C["card"],
+            fg=C["muted_dark"],
+            font=app.f_tiny,
+            anchor="e",
+        ).pack(side="right")
+
+        body = tk.Frame(inner, bg=C["card"])
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+
+        left = tk.Frame(body, bg=C["card"], width=s(292))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, s(12)))
+        left.grid_propagate(False)
+        tk.Label(
+            left,
+            text="搜索结果",
+            bg=C["card"],
+            fg=C["muted"],
+            font=app.f_small_bold,
+            anchor="w",
+        ).pack(fill="x")
+        results_wrap = tk.Frame(
+            left,
+            bg=C["card_alt"],
+            highlightbackground=C["border"],
+            highlightthickness=max(1, s(1)),
+        )
+        results_wrap.pack(fill="both", expand=True, pady=(s(5), 0))
+        self.tree = ttk.Treeview(
+            results_wrap,
+            columns=("title", "words"),
+            show="headings",
+            selectmode="browse",
+            style="Versions.Treeview",
+        )
+        self.tree.heading("title", text="条目", anchor="w")
+        self.tree.heading("words", text="字数", anchor="e")
+        self.tree.column("title", width=s(222), minwidth=s(140), anchor="w", stretch=True)
+        self.tree.column("words", width=s(52), minwidth=s(44), anchor="e", stretch=False)
+        tree_scroll = SlimScrollbar(results_wrap, command=self.tree.yview, bg=C["card_alt"])
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        right = tk.Frame(body, bg=C["card"])
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        page_head = tk.Frame(right, bg=C["card"])
+        page_head.grid(row=0, column=0, sticky="ew")
+        self.page_title_label = tk.Label(
+            page_head,
+            text="搜索后选择左侧条目开始阅读",
+            bg=C["card"],
+            fg=C["text_soft"],
+            font=app.f_h2,
+            anchor="w",
+            justify="left",
+        )
+        self.page_title_label.pack(side="left", fill="x", expand=True)
+        self.open_btn = Button(
+            page_head,
+            "在浏览器打开",
+            self._open_browser,
+            kind="link",
+            font=app.f_small_bold,
+            padx=0,
+            pady=s(2),
+        )
+        self.open_btn.pack(side="right", padx=(s(10), 0))
+        self.open_btn.set_enabled(False)
+        self.reload_btn = Button(
+            page_head,
+            "重新读取",
+            self._reload_page,
+            kind="ghost",
+            font=app.f_small,
+            padx=s(10),
+            pady=s(3),
+        )
+        self.reload_btn.pack(side="right")
+
+        text_wrap = tk.Frame(
+            right,
+            bg=C["card_alt"],
+            highlightbackground=C["border"],
+            highlightthickness=max(1, s(1)),
+        )
+        text_wrap.grid(row=1, column=0, sticky="nsew", pady=(s(6), 0))
+        self.text = tk.Text(
+            text_wrap,
+            bg=C["card_alt"],
+            fg=C["text_soft"],
+            insertbackground=C["text"],
+            relief="flat",
+            bd=0,
+            wrap="word",
+            font=app.f_small,
+            padx=s(14),
+            pady=s(11),
+            spacing1=s(1),
+            spacing3=s(2),
+        )
+        text_scroll = SlimScrollbar(text_wrap, command=self.text.yview, bg=C["card_alt"])
+        self.text.configure(yscrollcommand=text_scroll.set)
+        text_scroll.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+        self.text.tag_configure(
+            "h1", font=app.f_h2, foreground=C["text"], spacing1=s(10), spacing3=s(3)
+        )
+        self.text.tag_configure(
+            "h2", font=app.f_body_bold, foreground=C["accent_dark"], spacing1=s(7), spacing3=s(2)
+        )
+        self.text.tag_configure("body", font=app.f_small, foreground=C["text_soft"])
+        self.text.configure(state="disabled")
+
+        self.status_label = tk.Label(
+            inner,
+            text="输入关键词后按回车开始搜索。",
+            bg=C["card"],
+            fg=C["muted"],
+            font=app.f_tiny,
+            anchor="w",
+        )
+        self.status_label.pack(fill="x", pady=(s(8), 0))
+
+        _center_window(self, app.root, s(1010), s(680))
+        self.minsize(s(760), s(480))
+        self.after(80, self._poll)
+        self.search_entry.focus_set()
+
+    # -- helpers --------------------------------------------------------
+    def _set_status(self, text: str, tone: str = "muted") -> None:
+        colors = {
+            "muted": C["muted"],
+            "working": C["warning"],
+            "done": C["accent"],
+            "error": C["danger"],
+        }
+        try:
+            self.status_label.configure(text=text, fg=colors.get(tone, C["muted"]))
+        except tk.TclError:
+            pass
+
+    # -- search ---------------------------------------------------------
+    def _start_search(self) -> None:
+        query = self.search_entry.get_value().strip()
+        if not query:
+            self._set_status("请先输入要搜索的关键词。", "error")
+            return
+        self._search_cancel.set()
+        cancel = threading.Event()
+        self._search_cancel = cancel
+        self._search_token += 1
+        token = self._search_token
+        self.search_btn.set_enabled(False)
+        self._set_status(f"正在搜索「{query}」…", "working")
+
+        def worker() -> None:
+            try:
+                hits = search_wiki(query, limit=20, cancel=cancel)
+            except DownloadCancelled:
+                return
+            except Exception as exc:
+                self._queue.put(("search_error", token, str(exc)))
+                return
+            self._queue.put(("search", token, hits))
+
+        threading.Thread(target=worker, name="mcvd-wiki-search", daemon=True).start()
+
+    def _on_search(self, hits: list[WikiHit]) -> None:
+        self._hits = hits
+        self.search_btn.set_enabled(True)
+        self.tree.delete(*self.tree.get_children())
+        for index, hit in enumerate(hits):
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(hit.title, hit.word_count or ""),
+            )
+        if not hits:
+            self._set_status("没有找到相关条目，换个关键词试试。", "error")
+            return
+        self._set_status(f"共 {len(hits)} 条结果，正在读取第一条…", "muted")
+        self.tree.selection_set("0")
+        self.tree.focus("0")
+
+    def _on_select(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        try:
+            index = int(selection[0])
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < len(self._hits):
+            hit = self._hits[index]
+            if hit.snippet:
+                self._set_status(hit.snippet, "muted")
+            self._load_page(hit.title)
+
+    # -- page -----------------------------------------------------------
+    def _load_page(self, title: str, *, force: bool = False) -> None:
+        name = (title or "").strip()
+        if not name:
+            return
+        self._page_cancel.set()
+        cancel = threading.Event()
+        self._page_cancel = cancel
+        self._page_token += 1
+        token = self._page_token
+        self.page_title_label.configure(text=name)
+        self.open_btn.set_enabled(False)
+        self._set_status(f"正在读取「{name}」…", "working")
+
+        def worker() -> None:
+            try:
+                page = fetch_wiki_page(name, cancel=cancel, use_cache=not force)
+            except DownloadCancelled:
+                return
+            except Exception as exc:
+                self._queue.put(("page_error", token, str(exc)))
+                return
+            self._queue.put(("page", token, page))
+
+        threading.Thread(target=worker, name="mcvd-wiki-page", daemon=True).start()
+
+    def _on_page(self, page: WikiPage) -> None:
+        self._page = page
+        self.page_title_label.configure(text=page.title)
+        self.open_btn.set_enabled(True)
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        for raw in page.text.splitlines():
+            line = raw.strip()
+            if not line:
+                self.text.insert("end", "\n")
+                continue
+            if line.startswith("==") and line.endswith("=="):
+                label = line.strip("=").strip()
+                tag = "h2" if line.startswith("===") else "h1"
+                self.text.insert("end", label + "\n", tag)
+                continue
+            self.text.insert("end", line + "\n", "body")
+        self.text.configure(state="disabled")
+        self.text.yview_moveto(0)
+        suffix = " · 来自本地缓存" if page.cached else ""
+        self._set_status(f"已载入「{page.title}」{suffix}", "done")
+
+    def _reload_page(self) -> None:
+        if self._page is not None:
+            self._load_page(self._page.title, force=True)
+
+    def _open_browser(self) -> None:
+        if self._page is None:
+            self._set_status("还没有打开任何条目。", "error")
+            return
+        open_url(self._page.url)
+
+    def _open_random(self) -> None:
+        self.random_btn.set_enabled(False)
+        self._set_status("正在抽取随机条目…", "working")
+
+        def worker() -> None:
+            try:
+                title = random_wiki_page()
+            except Exception as exc:
+                self._queue.put(("random_error", str(exc)))
+                return
+            self._queue.put(("random", title))
+
+        threading.Thread(target=worker, name="mcvd-wiki-random", daemon=True).start()
+
+    # -- event pump -----------------------------------------------------
+    def _poll(self) -> None:
+        if self._closed:
+            return
+        try:
+            while True:
+                try:
+                    event = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                kind = event[0]
+                if kind == "search" and event[1] == self._search_token:
+                    self._on_search(event[2])
+                elif kind == "search_error" and event[1] == self._search_token:
+                    self.search_btn.set_enabled(True)
+                    self._set_status(f"搜索失败：{event[2]}", "error")
+                elif kind == "page" and event[1] == self._page_token:
+                    self._on_page(event[2])
+                elif kind == "page_error" and event[1] == self._page_token:
+                    self._set_status(f"读取失败：{event[2]}", "error")
+                elif kind == "random":
+                    self.random_btn.set_enabled(True)
+                    self.search_entry.set_value(event[1])
+                    self._load_page(event[1])
+                elif kind == "random_error":
+                    self.random_btn.set_enabled(True)
+                    self._set_status(f"随机条目失败：{event[1]}", "error")
+        finally:
+            if not self._closed:
+                self.after(80, self._poll)
+
+    def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._search_cancel.set()
+        self._page_cancel.set()
+        self.destroy()
+
+
+class ModsDialog(tk.Toplevel):
+    """Browse Modrinth and install mod jars into ``<game>/mods``."""
+
+    def __init__(self, app: "Application"):
+        super().__init__(app.root)
+        self.app = app
+        self.configure(bg=C["bg"])
+        self.title("下载模组 · Modrinth")
+        self.transient(app.root)
+        self._closed = False
+        self._queue: queue.Queue = queue.Queue()
+        self._search_cancel = threading.Event()
+        self._versions_cancel = threading.Event()
+        self._download_cancel = threading.Event()
+        self._search_token = 0
+        self._versions_token = 0
+        self._projects: list[ModProject] = []
+        self._versions: list[ModVersion] = []
+        self._project: ModProject | None = None
+        self._downloading = False
+        _try_icon(self)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda _event: self._close())
+
+        shell = Card(self)
+        shell.pack(fill="both", expand=True, padx=s(1), pady=s(1))
+        inner = tk.Frame(shell, bg=C["card"])
+        inner.pack(fill="both", expand=True, padx=s(20), pady=s(16))
+
+        tk.Label(
+            inner,
+            text="下载模组 · Modrinth",
+            bg=C["card"],
+            fg=C["text"],
+            font=app.f_h1,
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            inner,
+            text=(
+                "从 Modrinth 搜索 Fabric / Quilt / Forge / NeoForge 模组，"
+                "下载后自动校验 SHA-1 并放入目标目录的 mods 文件夹。"
+            ),
+            bg=C["card"],
+            fg=C["muted"],
+            font=app.f_small,
+            anchor="w",
+            justify="left",
+            wraplength=s(940),
+        ).pack(fill="x", pady=(s(3), s(12)))
+
+        filters = tk.Frame(inner, bg=C["card"])
+        filters.pack(fill="x", pady=(0, s(11)))
+        self.search_entry = PlaceholderEntry(
+            filters, "搜索模组，如 sodium / 钠 / JEI", width=26, font=app.f_small
+        )
+        self.search_entry.pack(side="left", ipady=s(6))
+        self.search_entry.bind("<Return>", lambda _event: self._start_search())
+
+        versions = self.app.release_version_ids()
+        self.version_var = tk.StringVar(value=versions[0] if versions else "全部版本")
+        self.version_combo = ttk.Combobox(
+            filters,
+            textvariable=self.version_var,
+            values=["全部版本", *versions],
+            state="readonly",
+            width=11,
+            style="Dark.TCombobox",
+            font=app.f_small,
+        )
+        self.version_combo.pack(side="left", padx=(s(8), 0))
+        self.version_combo.bind("<<ComboboxSelected>>", lambda _event: self._filters_changed())
+
+        self.loader_var = tk.StringVar(value="全部")
+        self.loader_combo = ttk.Combobox(
+            filters,
+            textvariable=self.loader_var,
+            values=["全部", *MOD_LOADER_LABELS.values()],
+            state="readonly",
+            width=10,
+            style="Dark.TCombobox",
+            font=app.f_small,
+        )
+        self.loader_combo.pack(side="left", padx=(s(8), 0))
+        self.loader_combo.bind("<<ComboboxSelected>>", lambda _event: self._filters_changed())
+
+        self.sort_var = tk.StringVar(value=MOD_SORT_OPTIONS["relevance"])
+        self.sort_combo = ttk.Combobox(
+            filters,
+            textvariable=self.sort_var,
+            values=list(MOD_SORT_OPTIONS.values()),
+            state="readonly",
+            width=11,
+            style="Dark.TCombobox",
+            font=app.f_small,
+        )
+        self.sort_combo.pack(side="left", padx=(s(8), 0))
+
+        self.search_btn = Button(
+            filters,
+            "搜索",
+            self._start_search,
+            kind="primary",
+            font=app.f_small_bold,
+            padx=s(18),
+            pady=s(6),
+        )
+        self.search_btn.pack(side="left", padx=(s(8), 0))
+
+        body = tk.Frame(inner, bg=C["card"])
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+
+        left = tk.Frame(body, bg=C["card"], width=s(470))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, s(12)))
+        left.grid_propagate(False)
+        tk.Label(
+            left,
+            text="搜索结果",
+            bg=C["card"],
+            fg=C["muted"],
+            font=app.f_small_bold,
+            anchor="w",
+        ).pack(fill="x")
+        results_wrap = tk.Frame(
+            left,
+            bg=C["card_alt"],
+            highlightbackground=C["border"],
+            highlightthickness=max(1, s(1)),
+        )
+        results_wrap.pack(fill="both", expand=True, pady=(s(5), 0))
+        self.tree = ttk.Treeview(
+            results_wrap,
+            columns=("name", "author", "downloads", "updated"),
+            show="headings",
+            selectmode="browse",
+            style="Versions.Treeview",
+        )
+        for column, title, width, anchor in (
+            ("name", "模组", s(196), "w"),
+            ("author", "作者", s(96), "w"),
+            ("downloads", "下载", s(66), "e"),
+            ("updated", "更新", s(66), "e"),
+        ):
+            self.tree.heading(column, text=title, anchor=anchor)
+            self.tree.column(
+                column,
+                width=width,
+                minwidth=max(s(44), width - s(30)),
+                anchor=anchor,
+                stretch=column == "name",
+            )
+        tree_scroll = SlimScrollbar(results_wrap, command=self.tree.yview, bg=C["card_alt"])
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self._on_project_select)
+
+        right = tk.Frame(body, bg=C["card"])
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(3, weight=1)
+
+        self.project_title = tk.Label(
+            right,
+            text="搜索后选择一个模组",
+            bg=C["card"],
+            fg=C["text_soft"],
+            font=app.f_h2,
+            anchor="w",
+            justify="left",
+            wraplength=s(520),
+        )
+        self.project_title.grid(row=0, column=0, sticky="ew")
+        self.project_meta = tk.Label(
+            right,
+            text="",
+            bg=C["card"],
+            fg=C["muted"],
+            font=app.f_tiny,
+            anchor="w",
+        )
+        self.project_meta.grid(row=1, column=0, sticky="ew", pady=(s(1), 0))
+        self.project_desc = tk.Label(
+            right,
+            text="",
+            bg=C["card"],
+            fg=C["text_soft"],
+            font=app.f_small,
+            anchor="w",
+            justify="left",
+            wraplength=s(520),
+        )
+        self.project_desc.grid(row=2, column=0, sticky="ew", pady=(s(5), s(8)))
+
+        versions_box = tk.Frame(right, bg=C["card"])
+        versions_box.grid(row=3, column=0, sticky="nsew")
+        versions_box.rowconfigure(1, weight=1)
+        versions_box.columnconfigure(0, weight=1)
+        tk.Label(
+            versions_box,
+            text="可用版本",
+            bg=C["card"],
+            fg=C["muted"],
+            font=app.f_small_bold,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        versions_wrap = tk.Frame(
+            versions_box,
+            bg=C["card_alt"],
+            highlightbackground=C["border"],
+            highlightthickness=max(1, s(1)),
+        )
+        versions_wrap.grid(row=1, column=0, sticky="nsew", pady=(s(5), 0))
+        self.versions_tree = ttk.Treeview(
+            versions_wrap,
+            columns=("version", "type", "game", "loader", "size"),
+            show="headings",
+            selectmode="browse",
+            style="Versions.Treeview",
+        )
+        for column, title, width, anchor in (
+            ("version", "版本号", s(150), "w"),
+            ("type", "类型", s(58), "w"),
+            ("game", "游戏版本", s(108), "w"),
+            ("loader", "加载器", s(92), "w"),
+            ("size", "大小", s(62), "e"),
+        ):
+            self.versions_tree.heading(column, text=title, anchor=anchor)
+            self.versions_tree.column(
+                column,
+                width=width,
+                minwidth=max(s(44), width - s(30)),
+                anchor=anchor,
+                stretch=column == "version",
+            )
+        versions_scroll = SlimScrollbar(
+            versions_wrap, command=self.versions_tree.yview, bg=C["card_alt"]
+        )
+        self.versions_tree.configure(yscrollcommand=versions_scroll.set)
+        versions_scroll.pack(side="right", fill="y")
+        self.versions_tree.pack(side="left", fill="both", expand=True)
+        self.versions_tree.bind("<<TreeviewSelect>>", self._on_version_select)
+        self.versions_tree.bind("<Double-1>", lambda _event: self._start_download())
+
+        target_row = tk.Frame(right, bg=C["card"])
+        target_row.grid(row=4, column=0, sticky="ew", pady=(s(10), 0))
+        tk.Label(
+            target_row,
+            text="下载到",
+            bg=C["card"],
+            fg=C["muted"],
+            font=app.f_tiny,
+        ).pack(side="left", padx=(0, s(6)))
+        self.target_var = tk.StringVar(value=str(mods_dir(app.game_dir)))
+        self.target_entry = tk.Entry(
+            target_row,
+            textvariable=self.target_var,
+            bg=C["card_alt"],
+            fg=C["text_soft"],
+            insertbackground=C["text"],
+            relief="flat",
+            bd=0,
+            highlightthickness=max(1, s(1)),
+            highlightbackground=C["border"],
+            highlightcolor=C["accent"],
+            font=app.f_tiny,
+            state="readonly",
+        )
+        self.target_entry.pack(side="left", fill="x", expand=True, ipady=s(4))
+        self.browse_btn = Button(
+            target_row,
+            "选择",
+            self._browse_target,
+            kind="ghost",
+            font=app.f_tiny,
+            padx=s(8),
+            pady=s(3),
+        )
+        self.browse_btn.pack(side="left", padx=(s(6), 0))
+        self.folder_btn = Button(
+            target_row,
+            "打开目录",
+            self._open_target,
+            kind="ghost",
+            font=app.f_tiny,
+            padx=s(8),
+            pady=s(3),
+        )
+        self.folder_btn.pack(side="left", padx=(s(6), 0))
+
+        action_row = tk.Frame(right, bg=C["card"])
+        action_row.grid(row=5, column=0, sticky="ew", pady=(s(9), 0))
+        self.progress = ProgressBar(action_row, height=s(8), bg=C["card"])
+        self.progress.pack(fill="x", pady=(0, s(7)))
+        self.status_label = tk.Label(
+            action_row,
+            text="选择模组和版本后即可下载。",
+            bg=C["card"],
+            fg=C["muted"],
+            font=app.f_tiny,
+            anchor="w",
+            justify="left",
+            wraplength=s(400),
+        )
+        self.status_label.pack(side="left", fill="x", expand=True)
+        self.download_btn = Button(
+            action_row,
+            "下载模组",
+            self._start_download,
+            kind="primary",
+            font=app.f_small_bold,
+            padx=s(18),
+            pady=s(7),
+        )
+        self.download_btn.pack(side="right", padx=(s(10), 0))
+        self.download_btn.set_enabled(False)
+
+        _center_window(self, app.root, s(1060), s(720))
+        self.minsize(s(860), s(560))
+        self.after(80, self._poll)
+        self.search_entry.focus_set()
+        self.after(200, self._start_search)
+
+    # -- filters --------------------------------------------------------
+    def _game_version(self) -> str | None:
+        value = self.version_var.get().strip()
+        return None if not value or value == "全部版本" else value
+
+    def _loader_key(self) -> str | None:
+        label = self.loader_var.get().strip()
+        if not label or label == "全部":
+            return None
+        for key, text in MOD_LOADER_LABELS.items():
+            if text == label:
+                return key
+        return None
+
+    def _sort_key(self) -> str:
+        label = self.sort_var.get().strip()
+        for key, text in MOD_SORT_OPTIONS.items():
+            if text == label:
+                return key
+        return "relevance"
+
+    def _filters_changed(self) -> None:
+        if self._project is not None:
+            self._load_versions(self._project)
+
+    # -- search ---------------------------------------------------------
+    def _start_search(self) -> None:
+        query = self.search_entry.get_value().strip()
+        self._search_cancel.set()
+        cancel = threading.Event()
+        self._search_cancel = cancel
+        self._search_token += 1
+        token = self._search_token
+        self.search_btn.set_enabled(False)
+        self._set_status("正在搜索 Modrinth…", "working")
+        game_version = self._game_version()
+        loader = self._loader_key()
+        sort = self._sort_key()
+
+        def worker() -> None:
+            try:
+                projects, total = search_mods(
+                    query,
+                    game_version=game_version,
+                    loader=loader,
+                    limit=30,
+                    sort=sort,
+                    cancel=cancel,
+                )
+            except DownloadCancelled:
+                return
+            except Exception as exc:
+                self._queue.put(("search_error", token, str(exc)))
+                return
+            self._queue.put(("search", token, projects, total))
+
+        threading.Thread(target=worker, name="mcvd-mods-search", daemon=True).start()
+
+    def _on_search(self, projects: list[ModProject], total: int) -> None:
+        self._projects = projects
+        self.search_btn.set_enabled(True)
+        self.tree.delete(*self.tree.get_children())
+        for index, project in enumerate(projects):
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    project.title,
+                    project.author,
+                    _count_text(project.downloads),
+                    friendly_date(project.updated),
+                ),
+            )
+        if not projects:
+            self._set_status("没有匹配的模组，试着放宽版本或加载器筛选。", "error")
+            return
+        self._set_status(f"共 {_count_text(total)} 个结果，正在读取第一条…", "muted")
+        self.tree.selection_set("0")
+        self.tree.focus("0")
+
+    def _on_project_select(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        try:
+            index = int(selection[0])
+        except (TypeError, ValueError):
+            return
+        if not (0 <= index < len(self._projects)):
+            return
+        project = self._projects[index]
+        self._project = project
+        self.project_title.configure(text=project.title)
+        self.project_meta.configure(
+            text=(
+                f"{project.author} · 下载 {_count_text(project.downloads)} · "
+                f"关注 {_count_text(project.follows)} · {project.url}"
+            )
+        )
+        self.project_desc.configure(text=project.description or "（没有简介）")
+        self._load_versions(project)
+
+    # -- versions -------------------------------------------------------
+    def _load_versions(self, project: ModProject) -> None:
+        self._versions_cancel.set()
+        cancel = threading.Event()
+        self._versions_cancel = cancel
+        self._versions_token += 1
+        token = self._versions_token
+        self.versions_tree.delete(*self.versions_tree.get_children())
+        self._versions = []
+        self.download_btn.set_enabled(False)
+        self._set_status("正在获取可用版本…", "working")
+        game_version = self._game_version()
+        loader = self._loader_key()
+
+        def worker() -> None:
+            try:
+                versions = fetch_mod_versions(
+                    project.project_id,
+                    game_version=game_version,
+                    loader=loader,
+                    cancel=cancel,
+                )
+            except DownloadCancelled:
+                return
+            except Exception as exc:
+                self._queue.put(("versions_error", token, str(exc)))
+                return
+            self._queue.put(("versions", token, versions))
+
+        threading.Thread(target=worker, name="mcvd-mods-versions", daemon=True).start()
+
+    def _on_versions(self, versions: list[ModVersion]) -> None:
+        self._versions = versions
+        self.versions_tree.delete(*self.versions_tree.get_children())
+        for index, version in enumerate(versions[:60]):
+            self.versions_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    version.version_number,
+                    version.type_label,
+                    version.game_label,
+                    version.loader_label,
+                    version.file.display_size,
+                ),
+            )
+        if not versions:
+            self._set_status("这个模组没有匹配当前筛选的版本，换个游戏版本或加载器。", "error")
+            return
+        self._set_status(f"共 {len(versions)} 个可用版本，已选中最新版。", "done")
+        self.versions_tree.selection_set("0")
+        self.versions_tree.focus("0")
+
+    def _selected_version(self) -> ModVersion | None:
+        selection = self.versions_tree.selection()
+        if not selection:
+            return None
+        try:
+            index = int(selection[0])
+        except (TypeError, ValueError):
+            return None
+        if 0 <= index < len(self._versions):
+            return self._versions[index]
+        return None
+
+    def _on_version_select(self, _event=None) -> None:
+        version = self._selected_version()
+        if version is None:
+            self.download_btn.set_enabled(False)
+            return
+        self.download_btn.set_enabled(not self._downloading)
+        self._set_status(
+            f"将下载 {version.file.filename}（{version.file.display_size}）", "muted"
+        )
+
+    # -- download -------------------------------------------------------
+    def _browse_target(self) -> None:
+        current = Path(self.target_var.get())
+        initial = current if current.exists() else Path.home()
+        chosen = filedialog.askdirectory(
+            parent=self, title="选择模组保存目录", initialdir=str(initial)
+        )
+        if chosen:
+            self.target_var.set(chosen)
+
+    def _open_target(self) -> None:
+        path = Path(self.target_var.get())
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_status(f"无法创建目录：{exc}", "error")
+            return
+        open_path(path)
+
+    def _start_download(self) -> None:
+        if self._downloading:
+            return
+        version = self._selected_version()
+        if version is None:
+            self._set_status("请先选择一个版本。", "error")
+            return
+        target = Path(self.target_var.get())
+        self._downloading = True
+        self._download_cancel = threading.Event()
+        cancel = self._download_cancel
+        self.download_btn.set_enabled(False)
+        self.search_btn.set_enabled(False)
+        self.progress.set(0)
+        self._set_status("开始下载…", "working")
+        total = version.file.size or 0
+        received = {"bytes": 0, "stamp": 0.0}
+
+        def on_chunk(amount: int) -> None:
+            received["bytes"] += amount
+            now = time.monotonic()
+            if now - received["stamp"] < 0.12:
+                return
+            received["stamp"] = now
+            self._queue.put(("progress", received["bytes"], total))
+
+        def worker() -> None:
+            try:
+                install = install_mod(
+                    version, target, cancel=cancel, on_progress=on_chunk
+                )
+            except DownloadCancelled:
+                self._queue.put(("download_cancelled",))
+                return
+            except Exception as exc:
+                self._queue.put(("download_error", str(exc)))
+                return
+            self._queue.put(("downloaded", install))
+
+        threading.Thread(target=worker, name="mcvd-mod-download", daemon=True).start()
+
+    def _finish_download(self) -> None:
+        self._downloading = False
+        self.download_btn.set_enabled(self._selected_version() is not None)
+        self.search_btn.set_enabled(True)
+
+    def _on_downloaded(self, install) -> None:
+        self._finish_download()
+        self.progress.set(1.0)
+        prefix = "已存在，无需重复下载" if install.skipped else "下载完成"
+        self._set_status(
+            f"{prefix}：{install.path.name}（{format_bytes(install.size)}）", "done"
+        )
+
+    # -- event pump -----------------------------------------------------
+    def _set_status(self, text: str, tone: str = "muted") -> None:
+        colors = {
+            "muted": C["muted"],
+            "working": C["warning"],
+            "done": C["accent"],
+            "error": C["danger"],
+        }
+        try:
+            self.status_label.configure(text=text, fg=colors.get(tone, C["muted"]))
+        except tk.TclError:
+            pass
+
+    def _poll(self) -> None:
+        if self._closed:
+            return
+        try:
+            while True:
+                try:
+                    event = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                kind = event[0]
+                if kind == "search" and event[1] == self._search_token:
+                    self._on_search(event[2], event[3])
+                elif kind == "search_error" and event[1] == self._search_token:
+                    self.search_btn.set_enabled(True)
+                    self._set_status(f"搜索失败：{event[2]}", "error")
+                elif kind == "versions" and event[1] == self._versions_token:
+                    self._on_versions(event[2])
+                elif kind == "versions_error" and event[1] == self._versions_token:
+                    self._set_status(f"获取版本失败：{event[2]}", "error")
+                elif kind == "progress":
+                    received, total = event[1], event[2]
+                    fraction = (received / total) if total else 0.0
+                    self.progress.set(fraction)
+                    self._set_status(
+                        f"正在下载 {format_bytes(received)}"
+                        + (f" / {format_bytes(total)}" if total else ""),
+                        "working",
+                    )
+                elif kind == "downloaded":
+                    self._on_downloaded(event[1])
+                elif kind == "download_error":
+                    self._finish_download()
+                    self._set_status(f"下载失败：{event[1]}", "error")
+                elif kind == "download_cancelled":
+                    self._finish_download()
+                    self._set_status("已取消下载。", "muted")
+        finally:
+            if not self._closed:
+                self.after(80, self._poll)
+
+    def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._search_cancel.set()
+        self._versions_cancel.set()
+        self._download_cancel.set()
+        self.destroy()
+
+
+
+class ThemeDialog(tk.Toplevel):
+    """Appearance settings: theme, accent colour and the frosted-glass effect."""
+
+    def __init__(self, app: "Application"):
+        super().__init__(app.root)
+        self.app = app
+        self.configure(bg=C["bg"])
+        self.title("外观设置")
+        self.transient(app.root)
+        self.resizable(False, False)
+        self._closed = False
+        self._original = (
+            app.settings.theme,
+            app.settings.accent,
+            app.settings.glass,
+        )
+        _try_icon(self)
+        self.protocol("WM_DELETE_WINDOW", self._finish)
+        self.bind("<Escape>", lambda _event: self._cancel())
+        self._render()
+        self.update_idletasks()
+        _center_window(self, app.root, s(600), max(s(520), self.winfo_reqheight()))
+
+    # -- layout ---------------------------------------------------------
+    def _render(self) -> None:
+        for child in list(self.winfo_children()):
+            child.destroy()
+        settings = self.app.settings
+        shell = Card(self)
+        shell.pack(fill="both", expand=True, padx=s(1), pady=s(1))
+        inner = tk.Frame(shell, bg=C["card"])
+        inner.pack(fill="both", expand=True, padx=s(22), pady=s(18))
+
+        tk.Label(
+            inner, text="外观设置", bg=C["card"], fg=C["text"],
+            font=self.app.f_h1, anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            inner,
+            text="主题与强调色会立即生效，关闭窗口后自动保存。",
+            bg=C["card"], fg=C["muted"], font=self.app.f_small, anchor="w",
+        ).pack(fill="x", pady=(s(3), s(14)))
+
+        tk.Label(
+            inner, text="主题", bg=C["card"], fg=C["muted"],
+            font=self.app.f_small_bold, anchor="w",
+        ).pack(fill="x")
+        theme_row = tk.Frame(inner, bg=C["card"])
+        theme_row.pack(fill="x", pady=(s(6), s(14)))
+        theme_row.columnconfigure(0, weight=1)
+        theme_row.columnconfigure(1, weight=1)
+        descriptions = {
+            "light": "白色明亮界面，适合白天使用",
+            "dark": "深色界面，夜间不刺眼",
+        }
+        for index, key in enumerate(THEME_ORDER):
+            card = ModeCard(
+                theme_row,
+                THEME_LABELS[key],
+                descriptions.get(key, ""),
+                key,
+                self._pick_theme,
+            )
+            card.grid(
+                row=0,
+                column=index,
+                sticky="nsew",
+                padx=(0, s(6)) if index == 0 else (s(6), 0),
+            )
+            card.set_selected(settings.theme == key)
+
+        tk.Label(
+            inner, text="强调色", bg=C["card"], fg=C["muted"],
+            font=self.app.f_small_bold, anchor="w",
+        ).pack(fill="x")
+        swatches = tk.Frame(inner, bg=C["card"])
+        swatches.pack(fill="x", pady=(s(8), s(14)))
+        for key in ACCENT_ORDER:
+            cell = tk.Frame(swatches, bg=C["card"])
+            cell.pack(side="left", padx=(0, s(16)))
+            color = accent_color(key, settings.theme)
+            selected = settings.accent == key
+            dot = tk.Canvas(
+                cell, width=s(42), height=s(42), bg=C["card"],
+                highlightthickness=0, cursor="hand2",
+            )
+            dot.pack()
+            inset = s(7) if selected else s(9)
+            dot.create_oval(
+                inset, inset, s(42) - inset, s(42) - inset,
+                fill=color,
+                outline=C["text"] if selected else C["border"],
+                width=max(2, s(2)) if selected else max(1, s(1)),
+            )
+            if selected:
+                dot.create_text(
+                    s(21), s(21), text="✓", fill="#ffffff",
+                    font=(self.app.family, 11, "bold"),
+                )
+            name = tk.Label(
+                cell, text=ACCENT_LABELS[key], bg=C["card"],
+                fg=C["text_soft"] if selected else C["muted"],
+                font=self.app.f_tiny,
+            )
+            name.pack(pady=(s(3), 0))
+            for widget in (dot, name):
+                widget.bind("<Button-1>", lambda _event, k=key: self._pick_accent(k))
+
+        tk.Label(
+            inner, text="卡片透明度", bg=C["card"], fg=C["muted"],
+            font=self.app.f_small_bold, anchor="w",
+        ).pack(fill="x", pady=(s(2), 0))
+        opacity_row = tk.Frame(inner, bg=C["card"])
+        opacity_row.pack(fill="x", pady=(s(5), 0))
+        self.opacity_value = tk.DoubleVar(value=float(100 - settings.card_opacity))
+        self.opacity_scale = ttk.Scale(
+            opacity_row,
+            from_=0,
+            to=50,
+            variable=self.opacity_value,
+            orient="horizontal",
+            style="Glass.Horizontal.TScale",
+            command=self._on_opacity_move,
+        )
+        self.opacity_scale.pack(side="left", fill="x", expand=True, padx=(0, s(10)))
+        self.opacity_scale.bind("<ButtonRelease-1>", self._on_opacity_commit)
+        self.opacity_label = tk.Label(
+            opacity_row,
+            text=f"{100 - settings.card_opacity:.0f}%",
+            bg=C["card"], fg=C["text_soft"], font=self.app.f_tiny,
+            width=5, anchor="e",
+        )
+        self.opacity_label.pack(side="right")
+        tk.Label(
+            inner,
+            text="0% 为不透明；数值越大，卡片越接近磨砂玻璃（文字仍保持可读）。",
+            bg=C["card"], fg=C["muted_dark"], font=self.app.f_tiny,
+            anchor="w", justify="left", wraplength=s(520),
+        ).pack(fill="x", pady=(s(3), s(8)))
+
+        CheckRow(
+            inner,
+            "毛玻璃效果（半透明模糊）",
+            settings.glass,
+            self._toggle_glass,
+            bg=C["card"],
+        ).pack(fill="x", pady=(s(2), 0))
+        tk.Label(
+            inner,
+            text="Windows 10/11 下窗口背景带模糊透明效果；关闭后窗口为纯色。",
+            bg=C["card"], fg=C["muted_dark"], font=self.app.f_tiny,
+            anchor="w", justify="left", wraplength=s(520),
+        ).pack(fill="x", pady=(s(2), 0))
+
+        buttons = tk.Frame(inner, bg=C["card"])
+        buttons.pack(fill="x", pady=(s(16), 0))
+        self.done_btn = Button(
+            buttons, "完成", self._finish, kind="primary",
+            font=self.app.f_small_bold, padx=s(20), pady=s(7),
+        )
+        self.done_btn.pack(side="right")
+        self.cancel_btn = Button(
+            buttons, "取消", self._cancel, kind="ghost",
+            font=self.app.f_small, padx=s(14), pady=s(7),
+        )
+        self.cancel_btn.pack(side="right", padx=(0, s(8)))
+        self.reset_btn = Button(
+            buttons, "恢复默认", self._reset, kind="ghost",
+            font=self.app.f_small, padx=s(14), pady=s(7),
+        )
+        self.reset_btn.pack(side="left")
+
+    # -- actions --------------------------------------------------------
+    def _apply(self) -> None:
+        self.app.apply_appearance(save=True)
+        self._render()
+
+    def _pick_theme(self, key: str) -> None:
+        if key == self.app.settings.theme:
+            return
+        self.app.settings.theme = key
+        self._apply()
+
+    def _pick_accent(self, key: str) -> None:
+        if key == self.app.settings.accent:
+            return
+        self.app.settings.accent = key
+        self._apply()
+
+    def _on_opacity_move(self, value) -> None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return
+        try:
+            self.opacity_label.configure(text=f"{number:.0f}%")
+        except tk.TclError:
+            pass
+
+    def _on_opacity_commit(self, _event=None) -> None:
+        try:
+            transparency = float(self.opacity_value.get())
+        except (tk.TclError, ValueError):
+            return
+        self.app.settings.card_opacity = int(round(100 - transparency))
+        self._apply()
+
+    def _toggle_glass(self, value: bool) -> None:
+        self.app.settings.glass = bool(value)
+        self.app.settings.save()
+        self.app._apply_window_effects()
+        self._render()
+
+    def _reset(self) -> None:
+        self.app.settings.theme = "light"
+        self.app.settings.accent = "green"
+        self.app.settings.glass = False
+        self.app.settings.card_opacity = 100
+        self._apply()
+
+    def _finish(self) -> None:
+        self.app.settings.save()
+        self._close()
+
+    def _cancel(self) -> None:
+        theme, accent, glass = self._original
+        self.app.settings.theme = theme
+        self.app.settings.accent = accent
+        self.app.settings.glass = glass
+        self.app.apply_appearance(save=True)
+        self._close()
+
+    def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+
 class Application:
     def __init__(self, root: tk.Tk, settings: Settings):
         self.root = root
@@ -2647,6 +3984,7 @@ class Application:
         self._filter_job: str | None = None
         self._detection_dialog: DetectionDialog | None = None
         self._stats_dialog: StatsDialog | None = None
+        self._theme_dialog: "ThemeDialog | None" = None
         self.cancel_event = threading.Event()
         self.events: queue.Queue = queue.Queue()
         self.download_thread: threading.Thread | None = None
@@ -2673,8 +4011,8 @@ class Application:
         self.root.report_callback_exception = self._report_callback_exception
         self.root.after(80, self._poll_events)
         self.root.after(500, self._tick_elapsed)
-        self.root.after(350, lambda: _set_dark_titlebar(self.root))
-        self.root.bind("<Map>", lambda _event: _set_dark_titlebar(self.root), add="+")
+        self.root.after(350, self._apply_window_effects)
+        self.root.bind("<Map>", lambda _event: self._apply_window_effects(), add="+")
         self.local_versions = scan_local_versions(self.game_dir)
         self._set_status("正在连接版本库…", "从 Mojang 官方源获取版本清单", "working")
         self._load_manifest_async()
@@ -2735,8 +4073,8 @@ class Application:
             pass
         style.map(
             "Versions.Treeview",
-            background=[("selected", "#1b3025")],
-            foreground=[("selected", "#eafff2")],
+            background=[("selected", C["selection_bg"])],
+            foreground=[("selected", C["selection_fg"])],
         )
         style.configure(
             "Versions.Treeview.Heading",
@@ -2765,6 +4103,15 @@ class Application:
             relief="flat",
             font=self.f_small,
         )
+        style.configure(
+            "Glass.Horizontal.TScale",
+            background=C["card"],
+            troughcolor=C["card_alt"],
+            bordercolor=C["border"],
+            lightcolor=C["accent"],
+            darkcolor=C["accent"],
+            gripcount=0,
+        )
         style.map(
             "Dark.TCombobox",
             fieldbackground=[("readonly", C["card_alt"]), ("disabled", C["card"])],
@@ -2772,6 +4119,10 @@ class Application:
             selectbackground=[("readonly", C["card_alt"])],
             selectforeground=[("readonly", C["text_soft"])],
         )
+
+    def _page_bg(self) -> str:
+        """Window backdrop: a colour key when glass is on, otherwise the theme bg."""
+        return GLASS_KEY if self.settings.glass else C["bg"]
 
     def _setup_window(self) -> None:
         global SCALE
@@ -2883,6 +4234,16 @@ class Application:
             pady=s(4),
         )
         self.about_btn.pack(side="right", padx=(0, s(8)))
+        self.theme_btn = Button(
+            right,
+            "外观",
+            self.open_theme_dialog,
+            kind="ghost",
+            font=self.f_small,
+            padx=s(10),
+            pady=s(4),
+        )
+        self.theme_btn.pack(side="right", padx=(0, s(8)))
         self.net_pill = tk.Frame(
             right,
             bg=C["card_alt"],
@@ -3012,10 +4373,10 @@ class Application:
 
     # -- body -----------------------------------------------------------
     def _build_body(self) -> None:
-        body = tk.Frame(self.root, bg=C["bg"])
+        body = tk.Frame(self.root, bg=self._page_bg())
         body.pack(fill="both", expand=True, padx=s(20), pady=(s(15), s(13)))
 
-        sidebar = tk.Frame(body, bg=C["bg"], width=s(332))
+        sidebar = tk.Frame(body, bg=self._page_bg(), width=s(332))
         sidebar.pack(side="right", fill="y")
         sidebar.pack_propagate(False)
 
@@ -3149,6 +4510,16 @@ class Application:
             font=self.f_small_bold, padx=0, pady=s(3),
         )
         self.stats_btn.pack(side="right", padx=(0, s(14)))
+        self.wiki_btn = Button(
+            toolbar, "Wiki", self.open_wiki_dialog, kind="link",
+            font=self.f_small_bold, padx=0, pady=s(3),
+        )
+        self.wiki_btn.pack(side="right", padx=(0, s(14)))
+        self.mods_btn = Button(
+            toolbar, "下载模组", self.open_mods_dialog, kind="link",
+            font=self.f_small_bold, padx=0, pady=s(3),
+        )
+        self.mods_btn.pack(side="right", padx=(0, s(14)))
 
         category_bar = tk.Frame(inner, bg=C["card"])
         category_bar.pack(fill="x", pady=(s(6), 0))
@@ -3365,28 +4736,6 @@ class Application:
         self._refresh_mode_cards()
         self._update_mode_tip()
 
-        tip_card = Card(sidebar)
-        tip_card.pack(fill="x", pady=(s(12), 0))
-        tip_inner = tk.Frame(tip_card, bg=C["card"])
-        tip_inner.pack(fill="x", padx=s(14), pady=s(11))
-        tk.Label(
-            tip_inner,
-            text="提示",
-            bg=C["card"],
-            fg=C["warning"],
-            font=self.f_small_bold,
-            anchor="w",
-        ).pack(anchor="w")
-        tk.Label(
-            tip_inner,
-            text="下载只包含游戏文件，启动游戏仍需 Java。完整安装不会自动下载 Java 运行时。",
-            bg=C["card"],
-            fg=C["muted"],
-            font=self.f_tiny,
-            justify="left",
-            anchor="w",
-            wraplength=s(275),
-        ).pack(fill="x", pady=(s(3), 0))
 
     # -- manifest / target ----------------------------------------------
     def _load_manifest_async(self, *, force: bool = False) -> None:
@@ -3598,13 +4947,14 @@ class Application:
             card.set_selected(key == self.mode)
 
     def _update_mode_tip(self) -> None:
+        note = "下载只包含游戏文件，启动游戏仍需 Java。"
         if self.mode == "core":
             self.mode_tip.configure(
-                text="写入已有启动器时最省空间；启动器会自行补全运行库。"
+                text="写入已有启动器时最省空间；启动器会自行补全运行库。\n" + note
             )
         else:
             self.mode_tip.configure(
-                text="下载客户端、库、原生库与全部资源；适合全新目录。"
+                text="下载客户端、库、原生库与全部资源；适合全新目录。\n" + note
             )
 
     # -- detection ------------------------------------------------------
@@ -3700,6 +5050,106 @@ class Application:
             self._stats_dialog.wait_window()
         finally:
             self._stats_dialog = None
+
+    def release_version_ids(self) -> list[str]:
+        """Release version ids from the loaded manifest, newest first."""
+        if self.manifest is None:
+            return []
+        return [
+            entry.id
+            for entry in self.manifest.versions
+            if entry.type == "release"
+        ][:120]
+
+    def _apply_window_effects(self) -> None:
+        """Title bar colour plus the optional acrylic blur."""
+        dark = is_dark(self.settings.theme)
+        _set_dark_titlebar(self.root, dark)
+        ok = apply_window_glass(self.root, bool(self.settings.glass), self.settings.theme)
+        if self.settings.glass and not ok:
+            LOGGER.info("glass effect unavailable; window stays opaque")
+        else:
+            LOGGER.debug(
+                "window effects theme=%s glass=%s ok=%s",
+                self.settings.theme,
+                self.settings.glass,
+                ok,
+            )
+
+    def apply_appearance(self, *, save: bool = True) -> None:
+        """Re-colour the whole window in place after a theme change."""
+        if self.busy:
+            return
+        filter_key = self.filter_var.get() if hasattr(self, "filter_var") else "all"
+        query = (
+            self.search_entry.get_value() if hasattr(self, "search_entry") else ""
+        )
+        apply_palette(C, self.settings.theme, self.settings.accent)
+        apply_card_opacity(C, self.settings.card_opacity)
+        try:
+            self.root.configure(bg=self._page_bg())
+        except tk.TclError:
+            return
+        for child in list(self.root.winfo_children()):
+            if isinstance(child, tk.Frame):
+                child.destroy()
+        self._setup_fonts()
+        self._setup_styles()
+        self._build_header()
+        self._build_footer()
+        self._build_body()
+        self._bind_shortcuts()
+        self.filter_var.set(filter_key)
+        self.search_entry.set_value(query)
+        if self.manifest is not None:
+            self._on_manifest(self.manifest)
+        else:
+            self._set_net_status("working", "连接版本库…")
+        self._refresh_mode_cards()
+        self._update_selected_ui()
+        self.root.after(30, self._apply_window_effects)
+        if save:
+            self.settings.save()
+        LOGGER.info(
+            "appearance applied theme=%s accent=%s glass=%s",
+            self.settings.theme,
+            self.settings.accent,
+            self.settings.glass,
+        )
+
+    def open_theme_dialog(self) -> None:
+        if self.busy:
+            return
+        try:
+            if self._theme_dialog is not None and self._theme_dialog.winfo_exists():
+                self._theme_dialog.lift()
+                self._theme_dialog.focus_force()
+                return
+        except tk.TclError:
+            pass
+        self._theme_dialog = ThemeDialog(self)
+        try:
+            self._theme_dialog.wait_window()
+        finally:
+            self._theme_dialog = None
+
+    def open_wiki_dialog(self) -> None:
+        if self.busy:
+            return
+        dialog = WikiDialog(self)
+        try:
+            dialog.wait_window()
+        finally:
+            pass
+
+    def open_mods_dialog(self) -> None:
+        if self.busy:
+            return
+        dialog = ModsDialog(self)
+        try:
+            dialog.wait_window()
+        finally:
+            pass
 
     def open_about(self) -> None:
         if self.busy:
@@ -3876,11 +5326,11 @@ class Application:
                 button.configure(
                     bg=C["card_alt"],
                     fg=C["muted"],
-                    activebackground="#1c2734",
+                    activebackground=C["hover_bg"],
                     activeforeground=C["text_soft"],
                 )
                 button._normal_bg = C["card_alt"]
-                button._active_bg = "#1c2734"
+                button._active_bg = C["hover_bg"]
 
     # -- status / busy --------------------------------------------------
     def _set_status(self, text: str, detail: str = "", tone: str = "idle") -> None:
@@ -4523,6 +5973,8 @@ def run_app() -> None:
     _cleanup_stale_runtime_dirs()
     _enable_dpi_awareness()
     settings = Settings.load()
+    apply_palette(C, settings.theme, settings.accent)
+    apply_card_opacity(C, settings.card_opacity)
     root = tk.Tk()
     root.withdraw()
     try:

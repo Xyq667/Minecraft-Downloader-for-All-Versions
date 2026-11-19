@@ -2,7 +2,7 @@
 
 一个面向 Windows 的 Minecraft Java 版版本下载与整理工具：下载官方版本、安装模组加载器、准备 Java 运行时。
 
-当前版本：**v1.1.0**  
+当前版本：**v2.0.0**  
 作者：**Xyq_yy**  
 GitHub：https://github.com/Xyq667/Minecraft-Downloader-for-All-Versions  
 Bilibili：https://space.bilibili.com/1364232155
